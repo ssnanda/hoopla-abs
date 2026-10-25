@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Hoopla page cataloguing and authorized local audiobook packaging.
+"""HPL: public book listing lookup and DRM-free local audio packaging.
 
-This utility does NOT log into Hoopla, export its loaned audio, or bypass DRM.
+Does not authenticate, retrieve licensed streams, or circumvent DRM.
+Adapted ideas for cover and metadata detection and chapter-name cleanup from
+MIT-licensed mkm4b: Copyright (c) 2026 Ignacio Deza (see NOTICE.txt).
 """
 
 import argparse
@@ -18,7 +20,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".wma", ".aiff", ".aif"}
 
 
@@ -26,7 +28,7 @@ class ToolError(Exception):
     pass
 
 
-def hoopla_book_url(value):
+def hpl_book_url(value):
     """Validate a public Hoopla audiobook listing, not arbitrary links."""
     parsed = urlsplit(value.strip())
     if parsed.scheme != "https" or parsed.hostname not in {"hoopladigital.com", "www.hoopladigital.com"}:
@@ -35,7 +37,7 @@ def hoopla_book_url(value):
     if not match:
         raise ToolError("Expected a URL like https://www.hoopladigital.com/audiobook/title-author/12345")
     return {
-        "provider": "hoopla",
+        "provider": "hpl",
         "media_type": "audiobook",
         "id": match.group(2),
         "slug": match.group(1),
@@ -135,8 +137,8 @@ def public_metadata_from_html(page, basic):
 
 
 def fetch_public_listing(url):
-    basic = hoopla_book_url(url)
-    req = Request(basic["url"], headers={"User-Agent": "HooplaBookTools/0.1 (public book information only)", "Accept": "text/html"})
+    basic = hpl_book_url(url)
+    req = Request(basic["url"], headers={"User-Agent": "HPL/0.2 (public book information only)", "Accept": "text/html"})
     try:
         with urlopen(req, timeout=15) as response:
             if response.status != 200:
@@ -202,15 +204,82 @@ def safe_filename(s):
     return out[:160] or "audiobook"
 
 
-def package_audio(source, output, title, author="", cover=None):
-    ffmpeg = ffmpeg_binary("ffmpeg")
-    ffmpeg_binary("ffprobe")
+def clean_chapter_name(filename):
+    """Adapt numbering cleanup from MIT-licensed mkm4b clean_title.
+
+    Only strip short track numbers followed by a separator. Avoid deleting
+    meaningful numeric names like '1984'.
+    """
+    result = re.sub(r"^\d{1,3}[\s._-]+", "", filename).strip()
+    return result or filename
+
+
+def input_files(source):
     source = Path(source).expanduser().resolve()
     if not source.is_dir():
         raise ToolError(f"Source folder not found: {source}")
-    files = sorted([x for x in source.iterdir() if x.is_file() and x.suffix.lower() in AUDIO_SUFFIXES], key=natural_key)
+    files = sorted((x for x in source.iterdir() if x.is_file() and x.suffix.lower() in AUDIO_SUFFIXES), key=natural_key)
     if not files:
         raise ToolError(f"No supported audio files in {source}")
+    return source, files
+
+
+def probe_details(path):
+    """Read local audio metadata and artwork disposition with ffprobe."""
+    text = run([ffmpeg_binary("ffprobe"), "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)])
+    return json.loads(text)
+
+
+def infer_metadata(source, files):
+    """Use album/artist from local source audio without changing it."""
+    for path in files:
+        tags = probe_details(path).get("format", {}).get("tags", {})
+        tags = {k.casefold(): str(v) for k, v in tags.items()}
+        title = tags.get("album") or tags.get("album_title") or ""
+        author = tags.get("album_artist") or tags.get("artist") or ""
+        if title or author:
+            return {"title": title or source.name, "author": author}
+    return {"title": source.name, "author": ""}
+
+
+def discover_cover(source, files, temporary):
+    """Inspired by mkm4b MIT auto_scan_cover; never write into source dir."""
+    for basename in ("cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "front.png"):
+        cover = source / basename
+        if cover.is_file():
+            return cover
+    for path in files:
+        streams = probe_details(path).get("streams", [])
+        if not any(s.get("codec_type") == "video" and s.get("disposition", {}).get("attached_pic") for s in streams):
+            continue
+        output = temporary / "embedded-cover.png"
+        try:
+            run([ffmpeg_binary("ffmpeg"), "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(path),
+                 "-map", "0:v:0", "-frames:v", "1", str(output)])
+        except ToolError:
+            continue
+        if output.exists() and output.stat().st_size:
+            return output
+    return None
+
+
+def folder_preview(source):
+    source, files = input_files(source)
+    tags = infer_metadata(source, files)
+    cover = next((str(source / name) for name in ("cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "front.png") if (source / name).is_file()), None)
+    return {"source": str(source), "tracks": [x.name for x in files],
+            "chapter_names": [clean_chapter_name(x.stem) for x in files],
+            "suggested_title": tags["title"], "suggested_author": tags["author"],
+            "cover_file": cover, "total_duration_seconds": round(sum(duration_ms(x) for x in files) / 1000, 3)}
+
+
+def package_audio(source, output, title=None, author=None, cover=None, auto_cover=True):
+    ffmpeg = ffmpeg_binary("ffmpeg")
+    ffmpeg_binary("ffprobe")
+    source, files = input_files(source)
+    inferred = infer_metadata(source, files) if title is None or author is None else {}
+    title = title if title is not None else inferred.get("title", source.name)
+    author = author if author is not None else inferred.get("author", "")
     output = Path(output).expanduser().resolve()
     if output.suffix.lower() != ".m4b":
         raise ToolError("Output filename must end with .m4b")
@@ -221,8 +290,12 @@ def package_audio(source, output, title, author="", cover=None):
         if not cover.is_file() or cover.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
             raise ToolError("Cover must be an existing JPG or PNG file")
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="hoopla-book-tools-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="hpl-") as temporary:
         temp = Path(temporary)
+        if not cover and auto_cover:
+            cover = discover_cover(source, files, temp)
+        if cover:
+            print(f"Cover: {Path(cover).name}")
         encoded = []
         durations = []
         names = []
@@ -233,7 +306,7 @@ def package_audio(source, output, title, author="", cover=None):
                  "-map", "0:a:0", "-vn", "-c:a", "aac", "-b:a", "96k", "-ar", "44100", "-ac", "2", str(part)])
             encoded.append(part)
             durations.append(duration_ms(part))
-            names.append(source_file.stem)
+            names.append(clean_chapter_name(source_file.stem))
             print(f"  [{index}/{len(files)}] {source_file.name}")
         listing = temp / "parts.txt"
         listing.write_text("".join(f"file '{ffconcat_escape(p)}'\n" for p in encoded), encoding="utf-8")
@@ -296,31 +369,34 @@ def do_sample(folder):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Public Hoopla listing lookup and packaging of authorized local audiobooks")
+    parser = argparse.ArgumentParser(description="HPL: audiobook catalog lookup and local M4B packaging")
     parser.add_argument("--version", action="version", version=VERSION)
     subs = parser.add_subparsers(dest="command", required=True)
-    subs.add_parser("doctor", help="Check local packaging tools (does not require Audiobookshelf)")
-    info = subs.add_parser("info", help="Read a public Hoopla audiobook listing (never logs in)")
-    info.add_argument("url", help="Public Hoopla audiobook URL")
+    subs.add_parser("doctor", help="Check local tools")
+    info = subs.add_parser("info", help="Read public HPL audiobook listing metadata")
+    info.add_argument("url", help="Public audiobook listing URL")
     info.add_argument("--fetch", action="store_true", help="Fetch public page title/author/cover URL; no authentication")
     info.add_argument("--save", metavar="FILE", help="Save information as JSON without overwriting")
-    pack = subs.add_parser("pack", help="Build chaptered M4B from local authorized audio files")
+    preview = subs.add_parser("preview", help="Review authorized local tracks and inferred metadata")
+    preview.add_argument("source")
+    pack = subs.add_parser("pack", help="Build M4B from local authorized audio files")
     pack.add_argument("source", help="Folder of existing audio tracks")
-    pack.add_argument("--title", required=True)
-    pack.add_argument("--author", default="")
-    pack.add_argument("--output", help="M4B destination (defaults to current directory)")
-    pack.add_argument("--cover", help="Optional local JPG/PNG cover")
+    pack.add_argument("--title", help="Override title; otherwise inferred from local tags/folder")
+    pack.add_argument("--author", help="Override author; otherwise inferred from local tags")
+    pack.add_argument("--output", help="M4B destination (defaults to input folder name in current directory)")
+    pack.add_argument("--cover", help="Override cover with a local JPG/PNG file")
+    pack.add_argument("--no-auto-cover", action="store_true", help="Disable cover auto-detection")
     inspect = subs.add_parser("inspect", help="Inspect an existing local audio file")
     inspect.add_argument("file")
     sample = subs.add_parser("sample", help="Generate and verify synthetic sample M4B")
-    sample.add_argument("--output", default="./hoopla-test-sample", help="Directory for test audio and M4B")
+    sample.add_argument("--output", default="./hpl-test-sample", help="Directory for test audio and M4B")
     args = parser.parse_args(argv)
     try:
         if args.command == "doctor":
-            print(f"Hoopla Audiobook Tools v{VERSION}\nPython: {sys.version.split()[0]}\nPlatform: {sys.platform}")
+            print(f"HPL v{VERSION}\nPython: {sys.version.split()[0]}\nPlatform: {sys.platform}")
             for name in ("ffmpeg", "ffprobe"):
                 print(f"{name}: {shutil.which(name) or 'NOT FOUND'}")
-            print("Hoopla account: not required; no login or extraction supported")
+            print("HPL account: not required; no login or protected-audio extraction")
             print("Audiobookshelf connection: not required")
         elif args.command == "info":
             data = fetch_public_listing(args.url) if args.fetch else hoopla_book_url(args.url)
@@ -332,9 +408,11 @@ def main(argv=None):
                     json.dump(data, file, indent=2, ensure_ascii=False)
                     file.write("\n")
                 print(f"Saved: {destination}")
+        elif args.command == "preview":
+            print(json.dumps(folder_preview(args.source), indent=2, ensure_ascii=False))
         elif args.command == "pack":
-            output = args.output or f"./{safe_filename(args.title)}.m4b"
-            package_audio(args.source, output, args.title, args.author, args.cover)
+            output = args.output or f"./{safe_filename(args.title or Path(args.source).name)}.m4b"
+            package_audio(args.source, output, args.title, args.author, args.cover, not args.no_auto_cover)
         elif args.command == "inspect":
             print(json.dumps(inspect_file(args.file), indent=2, ensure_ascii=False))
         elif args.command == "sample":
