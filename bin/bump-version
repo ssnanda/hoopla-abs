@@ -1,0 +1,91 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    echo "Usage: ./bin/bump-version patch|minor|major|X.Y.Z" >&2
+    exit 2
+}
+
+[ "$#" -eq 1 ] || usage
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo_dir"
+
+command -v git >/dev/null 2>&1 || {
+    echo "ERROR: git is not installed or not on PATH" >&2
+    exit 1
+}
+
+branch=$(git branch --show-current)
+[ "$branch" = "main" ] || {
+    echo "ERROR: version bumps must run from main (current branch: ${branch:-detached HEAD})" >&2
+    exit 1
+}
+
+[ -z "$(git status --porcelain)" ] || {
+    echo "ERROR: working tree is not clean; commit or stash existing changes first" >&2
+    exit 1
+}
+
+current=$(python3 -c 'import re; from pathlib import Path; text = Path("hpl.py").read_text(encoding="utf-8"); match = re.search(r"^VERSION = \"([0-9]+\.[0-9]+\.[0-9]+)\"$", text, re.MULTILINE); print(match.group(1) if match else "")')
+[ -n "$current" ] || {
+    echo "ERROR: couldn't find VERSION in hpl.py" >&2
+    exit 1
+}
+
+case "$1" in
+    patch|minor|major)
+        next=$(python3 - "$current" "$1" <<'PY'
+import sys
+
+parts = [int(part) for part in sys.argv[1].split(".")]
+level = sys.argv[2]
+if level == "major":
+    parts = [parts[0] + 1, 0, 0]
+elif level == "minor":
+    parts = [parts[0], parts[1] + 1, 0]
+else:
+    parts[2] += 1
+print(".".join(map(str, parts)))
+PY
+        )
+        ;;
+    *)
+        next=$(python3 - "$1" <<'PY'
+import re
+import sys
+
+value = sys.argv[1]
+if not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", value):
+    raise SystemExit(2)
+print(value)
+PY
+        ) || usage
+        ;;
+esac
+
+[ "$next" != "$current" ] || {
+    echo "ERROR: version is already $current" >&2
+    exit 1
+}
+
+python3 - "$current" "$next" <<'PY'
+import sys
+from pathlib import Path
+
+path = Path("hpl.py")
+old, new = sys.argv[1:]
+text = path.read_text(encoding="utf-8")
+before = f'VERSION = "{old}"'
+after = f'VERSION = "{new}"'
+if text.count(before) != 1:
+    raise SystemExit("ERROR: expected exactly one current VERSION declaration")
+path.write_text(text.replace(before, after), encoding="utf-8")
+PY
+
+git diff --check -- hpl.py
+git add -- hpl.py
+git commit -m "Bump HPL version to $next"
+git push origin main
+
+echo "HPL version bumped from $current to $next and pushed to origin/main"
