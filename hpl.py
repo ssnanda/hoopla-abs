@@ -20,7 +20,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-VERSION = "0.2.2"
+VERSION = "0.2.3"
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".m4b", ".mp4", ".aac", ".wav", ".flac", ".ogg", ".opus", ".wma", ".aiff", ".aif"}
 MAX_PUBLIC_PAGE_BYTES = 2_000_000
 MAX_COVER_BYTES = 15_000_000
