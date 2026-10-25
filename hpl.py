@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""HPL: public book listing lookup and DRM-free local audio packaging.
+"""HPL: public listing lookup and packaging of authorized local audio.
 
 Does not authenticate, retrieve licensed streams, or circumvent DRM.
-Adapted ideas for cover and metadata detection and chapter-name cleanup from
-MIT-licensed mkm4b: Copyright (c) 2026 Ignacio Deza (see NOTICE.txt).
 """
 
 import argparse
@@ -20,7 +18,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 AUDIO_SUFFIXES = {".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus", ".wma", ".aiff", ".aif"}
 
 
@@ -205,13 +203,9 @@ def safe_filename(s):
 
 
 def clean_chapter_name(filename):
-    """Adapt numbering cleanup from MIT-licensed mkm4b clean_title.
-
-    Only strip short track numbers followed by a separator. Avoid deleting
-    meaningful numeric names like '1984'.
-    """
-    result = re.sub(r"^\d{1,3}[\s._-]+", "", filename).strip()
-    return result or filename
+    """Remove a track index while preserving numeric chapter titles."""
+    match = re.match(r"^[0-9]{1,3}[ ._-]+(.+)$", filename)
+    return match.group(1).strip() if match and match.group(1).strip() else filename
 
 
 def input_files(source):
@@ -243,7 +237,7 @@ def infer_metadata(source, files):
 
 
 def discover_cover(source, files, temporary):
-    """Inspired by mkm4b MIT auto_scan_cover; never write into source dir."""
+    """Find local artwork or extract embedded artwork into temporary storage."""
     for basename in ("cover.jpg", "cover.jpeg", "cover.png", "folder.jpg", "folder.png", "front.jpg", "front.png"):
         cover = source / basename
         if cover.is_file():
